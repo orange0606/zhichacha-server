@@ -45,7 +45,7 @@ CREATE TABLE `order` (
   `shop_id` BIGINT NOT NULL COMMENT '店铺业务ID',
   `shop_name` VARCHAR(100) NOT NULL COMMENT '店铺名称',
   `order_no` VARCHAR(64) NOT NULL COMMENT '订单号',
-  `goods_name` VARCHAR(255) DEFAULT NULL COMMENT '商品名称',
+  `goods_name` VARCHAR(2000) DEFAULT NULL COMMENT '商品名称',
   `goods_count` INT DEFAULT 1 COMMENT '订购数量',
   `pay_amount` DECIMAL(10,2) DEFAULT 0.00 COMMENT '应付金额',
   `order_time` DATETIME NOT NULL COMMENT '下单时间',
