@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
-const { isAddressMatch } = require('../utils/addressMatcher')
+const { preprocessAddresses, batchMatchAddress } = require('../utils/addressMatcher')
 
 /**
  * 风险检测接口
@@ -44,7 +44,9 @@ router.get('/riskQuery', auth, async (req, res) => {
            AND o.order_time >= DATE_SUB(NOW(), INTERVAL 14 DAY)
          ORDER BY o.order_time DESC`
       )
-      orders = rows.filter(o => isAddressMatch(searchKey, o.buyer_address))
+      const preprocessed = preprocessAddresses(rows.map(o => o.buyer_address))
+      const matchedIndexes = batchMatchAddress(searchKey, preprocessed)
+      orders = matchedIndexes.map(i => rows[i])
     }
 
     // 分析风险等级

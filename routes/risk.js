@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
-const { isAddressMatch } = require('../utils/addressMatcher')
+const { preprocessAddresses, batchMatchAddress } = require('../utils/addressMatcher')
 
 /**
  * 批量风险匹配接口
@@ -40,18 +40,17 @@ router.post('/batchMatch', auth, async (req, res) => {
     const addressOrderMap = {}
     if (allAddresses.length > 0) {
       const [allOrderAddrRows] = await pool.query(
-        `SELECT DISTINCT buyer_address, shop_id FROM \`order\` WHERE buyer_address IS NOT NULL AND CHAR_LENGTH(buyer_address) >= 6 AND buyer_address NOT LIKE '%*%'`
+        `SELECT DISTINCT buyer_address, shop_id FROM \`order\`
+         WHERE buyer_address IS NOT NULL AND CHAR_LENGTH(buyer_address) >= 6
+           AND buyer_address NOT LIKE '%*%'`
       )
+      const preprocessed = preprocessAddresses(allOrderAddrRows.map(r => r.buyer_address))
       for (const addr of allAddresses) {
         if (!addr || addr.length < 6) continue
-        const shopIds = new Set()
-        allOrderAddrRows.forEach(r => {
-          if (!r.buyer_address) return
-          if (isAddressMatch(addr, r.buyer_address)) {
-            shopIds.add(String(r.shop_id))
-          }
-        })
-        if (shopIds.size > 0) {
+        const matchedIndexes = batchMatchAddress(addr, preprocessed)
+        if (matchedIndexes.length > 0) {
+          const shopIds = new Set()
+          matchedIndexes.forEach(i => shopIds.add(String(allOrderAddrRows[i].shop_id)))
           addressOrderMap[addr] = { shopIds }
         }
       }
@@ -72,30 +71,23 @@ router.post('/batchMatch', auth, async (req, res) => {
     const addressReportMap = {}
     const similarReportMap = {}
     if (allAddresses.length > 0) {
-      // 取出所有举报地址
       const [allReportRows] = await pool.query(
-        `SELECT DISTINCT receiver_address FROM report WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6 AND receiver_address NOT LIKE '%*%' LIMIT 2000`
+        `SELECT DISTINCT receiver_address FROM report
+         WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
+           AND receiver_address NOT LIKE '%*%' LIMIT 5000`
       )
       const allReportAddrs = allReportRows.map(r => r.receiver_address)
+      const preprocessed = preprocessAddresses(allReportAddrs)
 
       for (const addr of allAddresses) {
         if (!addr || addr.length < 6) continue
-        // 精确匹配
-        let exactCnt = 0
-        const similar = []
-        allReportAddrs.forEach(rAddr => {
-          if (!rAddr || rAddr.length < 6) return
-          if (rAddr === addr) {
-            exactCnt++
-          } else if (isAddressMatch(addr, rAddr)) {
-            similar.push(rAddr)
-          }
-        })
-        if (exactCnt > 0) {
-          addressReportMap[addr] = exactCnt
-        }
-        if (similar.length > 0) {
-          similarReportMap[addr] = [...new Set(similar)].slice(0, 5)
+        const matchedIndexes = batchMatchAddress(addr, preprocessed)
+        if (matchedIndexes.length > 0) {
+          const matchedAddrs = matchedIndexes.map(i => allReportAddrs[i])
+          const exactCnt = matchedAddrs.filter(a => a === addr).length
+          const similar = [...new Set(matchedAddrs.filter(a => a !== addr))].slice(0, 5)
+          if (exactCnt > 0) addressReportMap[addr] = exactCnt
+          if (similar.length > 0) similarReportMap[addr] = similar
         }
       }
     }
@@ -108,21 +100,18 @@ router.post('/batchMatch', auth, async (req, res) => {
       const tags = []
       let riskLevel = 'none'
 
-      // 账号举报
       const accReportCount = accountReportMap[buyerAccount] || 0
       if (accReportCount > 0) {
         tags.push(`账号被举报${accReportCount}次`)
         riskLevel = 'high'
       }
 
-      // 地址精确举报
       const addrReportCount = addressReportMap[buyerAddress] || 0
       if (addrReportCount > 0) {
         tags.push(`地址被举报${addrReportCount}次`)
         riskLevel = 'high'
       }
 
-      // 地址相似举报
       const similarAddrs = similarReportMap[buyerAddress] || []
       const similarity = similarAddrs.length > 0
         ? Math.min(95, 70 + similarAddrs.length * 10)
@@ -132,7 +121,6 @@ router.post('/batchMatch', auth, async (req, res) => {
         if (riskLevel === 'none') riskLevel = 'high'
       }
 
-      // 账号跨店
       const accStat = accountOrderMap[buyerAccount]
       const crossShopCount = accStat ? accStat.shopIds.size : 1
       if (crossShopCount >= 2) {
@@ -140,7 +128,6 @@ router.post('/batchMatch', auth, async (req, res) => {
         if (riskLevel === 'none') riskLevel = 'medium'
       }
 
-      // 地址跨店
       const addrStat = addressOrderMap[buyerAddress]
       const addrCrossShopCount = addrStat ? addrStat.shopIds.size : 1
       if (addrCrossShopCount >= 2) {
@@ -167,19 +154,31 @@ router.post('/batchMatch', auth, async (req, res) => {
       }
     })
 
-    // ========== 6. 同店铺多单（低风险） ==========
-    for (const r of results) {
-      if (r.riskLevel !== 'none') continue
-      if (!r.shopId || !r.buyerAccount) continue
+    // ========== 6. 同店铺多单（低风险，批量查询避免N+1） ==========
+    const needCheck = results.filter(r => r.riskLevel === 'none' && r.shopId && r.buyerAccount)
+    if (needCheck.length > 0) {
+      // 按 shopId + buyerAccount 分组批量查
+      const conditions = []
+      const params = []
+      for (const r of needCheck) {
+        conditions.push('(shop_id = ? AND buyer_account = ?)')
+        params.push(r.shopId, r.buyerAccount)
+      }
       const [cntRows] = await pool.query(
-        `SELECT COUNT(*) as cnt FROM \`order\` WHERE shop_id = ? AND buyer_account = ?`,
-        [r.shopId, r.buyerAccount]
+        `SELECT shop_id, buyer_account, COUNT(*) as cnt FROM \`order\`
+         WHERE ${conditions.join(' OR ')}
+         GROUP BY shop_id, buyer_account`,
+        params
       )
-      const sameCnt = cntRows[0].cnt || 0
-      if (sameCnt >= 2) {
-        r.tags.push(`同店铺下单${sameCnt}次`)
-        r.riskLevel = 'low'
-        r.riskLevelText = '低风险'
+      const cntMap = {}
+      cntRows.forEach(r => { cntMap[`${r.shop_id}_${r.buyer_account}`] = r.cnt })
+      for (const r of needCheck) {
+        const sameCnt = cntMap[`${r.shopId}_${r.buyerAccount}`] || 0
+        if (sameCnt >= 2) {
+          r.tags.push(`同店铺下单${sameCnt}次`)
+          r.riskLevel = 'low'
+          r.riskLevelText = '低风险'
+        }
       }
     }
 

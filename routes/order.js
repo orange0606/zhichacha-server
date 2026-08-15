@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
-const { isAddressMatch } = require('../utils/addressMatcher')
+const { isAddressMatch, preprocessAddresses, batchMatchAddress } = require('../utils/addressMatcher')
 
 // 获取订单列表
 router.get('/list', auth, async (req, res) => {
@@ -475,24 +475,23 @@ router.post('/matchByAccount', auth, async (req, res) => {
       accountOrders = rows
     }
 
-    // 第四步：全库查询地址匹配订单（全部时段，智能模糊匹配）
-    // 用自己店铺的地址作为key，匹配到的全库订单都归到这个key下（写法不同但实际同一地址）
-    const addressMatchMap = new Map() // key: 自己的地址, value: 匹配到的全库订单数组
+    // 第四步：全库查询地址匹配订单（智能模糊匹配）
+    const addressMatchMap = new Map()
     if (addresses.length > 0) {
       const [allAddrOrders] = await pool.query(
         `SELECT o.* FROM \`order\` o
-         WHERE o.buyer_address IS NOT NULL AND CHAR_LENGTH(o.buyer_address) >= 6 AND o.buyer_address NOT LIKE '%*%'
+         WHERE o.buyer_address IS NOT NULL AND CHAR_LENGTH(o.buyer_address) >= 6
+           AND o.buyer_address NOT LIKE '%*%'
          ORDER BY o.order_time DESC`
       )
+      // 预处理全库地址（标准化一次）
+      const preprocessed = preprocessAddresses(allAddrOrders.map(o => o.buyer_address))
       addresses.forEach(addr => {
         if (!addr || addr.length < 6) return
-        allAddrOrders.forEach(o => {
-          if (!o.buyer_address) return
-          if (isAddressMatch(addr, o.buyer_address)) {
-            if (!addressMatchMap.has(addr)) addressMatchMap.set(addr, [])
-            addressMatchMap.get(addr).push(o)
-          }
-        })
+        const matchedIndexes = batchMatchAddress(addr, preprocessed)
+        if (matchedIndexes.length > 0) {
+          addressMatchMap.set(addr, matchedIndexes.map(i => allAddrOrders[i]))
+        }
       })
     }
 
@@ -511,16 +510,15 @@ router.post('/matchByAccount', auth, async (req, res) => {
     const addressReportMap = {}
     if (addresses.length > 0) {
       const [allReportRows] = await pool.query(
-        `SELECT receiver_address FROM report WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6 AND receiver_address NOT LIKE '%*%'`
+        `SELECT receiver_address FROM report
+         WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
+           AND receiver_address NOT LIKE '%*%'`
       )
       const allReportAddrs = allReportRows.map(r => r.receiver_address)
+      const preprocessed = preprocessAddresses(allReportAddrs)
       addresses.forEach(addr => {
         if (!addr || addr.length < 6) return
-        let cnt = 0
-        allReportAddrs.forEach(rAddr => {
-          if (!rAddr || rAddr.length < 6) return
-          if (isAddressMatch(addr, rAddr)) cnt++
-        })
+        const cnt = batchMatchAddress(addr, preprocessed).length
         if (cnt > 0) addressReportMap[addr] = cnt
       })
     }

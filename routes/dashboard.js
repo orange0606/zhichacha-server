@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
-const { isAddressMatch } = require('../utils/addressMatcher')
+const { preprocessAddresses, batchMatchAddress } = require('../utils/addressMatcher')
 
 /**
  * 根据时间范围获取开始时间
@@ -111,11 +111,15 @@ router.get('/overview', auth, async (req, res) => {
         const riskAddresses = new Set()
         if (addresses.length > 0) {
           const [allReportRows] = await pool.query(
-            `SELECT DISTINCT receiver_address FROM report WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6 AND receiver_address NOT LIKE '%*%'`
+            `SELECT DISTINCT receiver_address FROM report
+             WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
+               AND receiver_address NOT LIKE '%*%'`
           )
           const allReportAddrs = allReportRows.map(r => r.receiver_address)
+          const preprocessed = preprocessAddresses(allReportAddrs)
           addresses.forEach(addr => {
-            if (allReportAddrs.some(rAddr => isAddressMatch(addr, rAddr))) {
+            if (!addr || addr.length < 6) return
+            if (batchMatchAddress(addr, preprocessed).length > 0) {
               riskAddresses.add(addr)
             }
           })
@@ -290,7 +294,7 @@ router.get('/risk-check', auth, async (req, res) => {
         .filter(addr => addr && !addr.includes('*'))
     )]
 
-    // 4. 全库查询这些账号在【全部时段】的所有订单（所有用户的店铺）
+    // 4. 全库查询这些账号的所有订单（所有用户的店铺）
     const accountPlaceholders = myAccounts.map(() => '?').join(',')
     const [allAccountOrders] = await pool.query(
       `SELECT shop_id, buyer_account FROM \`order\`
@@ -298,23 +302,22 @@ router.get('/risk-check', auth, async (req, res) => {
       myAccounts
     )
 
-    // 5. 全库查询这些地址在【全部时段】的所有订单（智能模糊匹配）
+    // 5. 全库查询这些地址的所有订单（智能模糊匹配）
     let allAddressOrders = []
     if (myAddresses.length > 0) {
       const [allAddrRows] = await pool.query(
         `SELECT shop_id, buyer_address FROM \`order\`
-         WHERE buyer_address IS NOT NULL AND CHAR_LENGTH(buyer_address) >= 6 AND buyer_address NOT LIKE '%*%'`
+         WHERE buyer_address IS NOT NULL AND CHAR_LENGTH(buyer_address) >= 6
+           AND buyer_address NOT LIKE '%*%'`
       )
+      const preprocessed = preprocessAddresses(allAddrRows.map(o => o.buyer_address))
       const matchedMap = new Map()
       myAddresses.forEach(addr => {
         if (!addr || addr.length < 6) return
-        allAddrRows.forEach(o => {
-          if (!o.buyer_address) return
-          if (isAddressMatch(addr, o.buyer_address)) {
-            if (!matchedMap.has(addr)) matchedMap.set(addr, [])
-            matchedMap.get(addr).push(o)
-          }
-        })
+        const matchedIndexes = batchMatchAddress(addr, preprocessed)
+        if (matchedIndexes.length > 0) {
+          matchedMap.set(addr, matchedIndexes.map(i => allAddrRows[i]))
+        }
       })
       matchedMap.forEach((orders, addr) => {
         orders.forEach(o => {
@@ -357,20 +360,19 @@ router.get('/risk-check', auth, async (req, res) => {
       reportRows.forEach(r => { accountReportMap[r.buyer_account] = r.cnt })
     }
 
-    // 9. 查询地址被举报次数（全库，智能模糊匹配）
+    // 9. 查询地址被举报次数（智能模糊匹配）
     const addressReportMap = {}
     if (myAddresses.length > 0) {
       const [allReportRows] = await pool.query(
-        `SELECT receiver_address FROM report WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6 AND receiver_address NOT LIKE '%*%'`
+        `SELECT receiver_address FROM report
+         WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
+           AND receiver_address NOT LIKE '%*%'`
       )
       const allReportAddrs = allReportRows.map(r => r.receiver_address)
+      const preprocessed = preprocessAddresses(allReportAddrs)
       myAddresses.forEach(addr => {
         if (!addr || addr.length < 6) return
-        let cnt = 0
-        allReportAddrs.forEach(rAddr => {
-          if (!rAddr || rAddr.length < 6) return
-          if (isAddressMatch(addr, rAddr)) cnt++
-        })
+        const cnt = batchMatchAddress(addr, preprocessed).length
         if (cnt > 0) addressReportMap[addr] = cnt
       })
     }

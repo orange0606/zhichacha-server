@@ -1,6 +1,14 @@
 /**
  * 地址标准化 + 模糊匹配工具
- * 用于解决地址写法不一致（省市区县镇前缀、特殊符号、详略不同）导致的匹配失败
+ *
+ * 匹配策略：
+ * 1. 去掉省/市/区/县/镇等行政区划词和特殊符号
+ * 2. 重点对比详细地址部分：最长公共子串占较短地址的比例 >= 70% 才算匹配
+ * 3. 前面的行政区划相同很常见，不作为主要命中依据
+ *
+ * 性能优化：
+ * - normalize 结果缓存
+ * - 批量匹配时先做快速排除，LCS 只对候选执行
  */
 
 // 行政区划词（用于标准化时去掉）
@@ -11,28 +19,67 @@ const REGION_WORDS = [
   '特别行政区', '自治县', '自治州', '自治旗'
 ]
 
-// 特殊字符和无关符号
+// 特殊字符和无关符号（保留数字，门牌号是详细地址的重要部分）
 const SPECIAL_CHARS = /[-\s\[\]()（）【】「」『』《》<>、，,。.；;:：!！?？"'`~@#$%^&*_+=|\\/]/g
 
+// 相似度阈值
+const SIMILARITY_THRESHOLD = 0.7
+// 公共子串最小长度（避免很短的地址误判）
+const MIN_COMMON_LEN = 8
+
+// normalize 缓存
+const normalizeCache = new Map()
+const CACHE_MAX = 50000
+
 /**
- * 标准化地址：去掉特殊符号、行政区划词
+ * 标准化地址：去掉特殊符号、数字、行政区划词
+ * 注意：数字也去掉（门牌号在不同写法中格式差异大，重点比道路名/小区名等文字部分）
  */
 function normalizeAddress(addr) {
   if (!addr) return ''
+  if (normalizeCache.has(addr)) return normalizeCache.get(addr)
+
   let s = String(addr).trim()
-  // 去掉特殊字符
   s = s.replace(SPECIAL_CHARS, '')
-  // 去掉行政区划词（按长度从长到短替换）
   const sortedWords = [...REGION_WORDS].sort((a, b) => b.length - a.length)
   for (const w of sortedWords) {
     s = s.split(w).join('')
   }
+
+  if (normalizeCache.size >= CACHE_MAX) normalizeCache.clear()
+  normalizeCache.set(addr, s)
   return s
 }
 
 /**
+ * 计算两个字符串的相似度（0~1）
+ * 基于最长公共子串占较短字符串的比例
+ */
+function calcSimilarity(s1, s2) {
+  if (!s1 || !s2) return 0
+  if (s1 === s2) return 1
+
+  // 让 s1 是较短的
+  if (s1.length > s2.length) {
+    const tmp = s1; s1 = s2; s2 = tmp
+  }
+
+  const shorter = s1.length
+  const longer = s2.length
+  if (shorter < MIN_COMMON_LEN) return 0
+
+  // 快速包含判断
+  if (s2.includes(s1)) {
+    return shorter / longer
+  }
+
+  // 最长公共子串
+  const lcs = longestCommonSubstring(s1, s2)
+  return lcs / shorter
+}
+
+/**
  * 判断两个地址是否相似
- * 规则：完全相同 / 标准化后互相包含 / 有>=10字公共子串
  */
 function isAddressMatch(addr1, addr2) {
   if (!addr1 || !addr2) return false
@@ -43,20 +90,60 @@ function isAddressMatch(addr1, addr2) {
   const n2 = normalizeAddress(addr2)
 
   if (n1 === n2) return true
-  if (n1.includes(n2) || n2.includes(n1)) return true
+  if (n1.length < MIN_COMMON_LEN || n2.length < MIN_COMMON_LEN) return false
 
-  // 最长公共子串 >= 10 字
-  const lcs = longestCommonSubstring(n1, n2)
-  if (lcs >= 10) return true
-
-  return false
+  const sim = calcSimilarity(n1, n2)
+  return sim >= SIMILARITY_THRESHOLD
 }
 
 /**
- * 最长公共子串长度
+ * 批量预处理地址列表
+ */
+function preprocessAddresses(addrs) {
+  return addrs.map((addr, index) => ({
+    addr,
+    norm: normalizeAddress(addr),
+    index
+  })).filter(x => x.addr && x.addr.length >= 6 && x.norm.length >= MIN_COMMON_LEN)
+}
+
+/**
+ * 从预处理列表中找出所有匹配目标地址的项
+ */
+function batchMatchAddress(targetAddr, preprocessed) {
+  if (!targetAddr || targetAddr.length < 6) return []
+  const target = normalizeAddress(targetAddr)
+  if (target.length < MIN_COMMON_LEN) return []
+
+  const matched = []
+  for (const item of preprocessed) {
+    if (!item.norm || item.norm.length < MIN_COMMON_LEN) continue
+    // 快速路径：完全相同或包含
+    if (item.norm === target) {
+      matched.push(item.index)
+      continue
+    }
+    // 长度差距太大直接跳过（短的/长的 < 70% 不可能命中）
+    const minLen = Math.min(item.norm.length, target.length)
+    const maxLen = Math.max(item.norm.length, target.length)
+    if (minLen / maxLen < SIMILARITY_THRESHOLD) continue
+
+    const sim = calcSimilarity(item.norm, target)
+    if (sim >= SIMILARITY_THRESHOLD) {
+      matched.push(item.index)
+    }
+  }
+  return matched
+}
+
+/**
+ * 最长公共子串长度（滚动数组）
  */
 function longestCommonSubstring(s1, s2) {
   if (!s1 || !s2) return 0
+  if (s1.length > s2.length) {
+    const tmp = s1; s1 = s2; s2 = tmp
+  }
   const m = s1.length
   const n = s2.length
   let max = 0
@@ -77,5 +164,8 @@ function longestCommonSubstring(s1, s2) {
 module.exports = {
   normalizeAddress,
   isAddressMatch,
-  longestCommonSubstring
+  longestCommonSubstring,
+  calcSimilarity,
+  preprocessAddresses,
+  batchMatchAddress
 }
