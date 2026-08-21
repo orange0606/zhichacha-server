@@ -193,6 +193,7 @@ router.get('/all-published', async (req, res) => {
   }
 })
 
+
 /**
  * GET /api/extension/download/:id/:type
  * 下载文件（公开），type: chrome | 360
@@ -219,6 +220,9 @@ router.get('/download/:id/:type', async (req, res) => {
     }
 
     const filePath = path.join(UPLOAD_DIR, filename)
+    // 调试打印，看实际读取的文件
+    console.log('[download] type=', type, 'filename=', filename, 'filePath=', filePath)
+
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ code: -1, msg: '文件不存在' })
     }
@@ -227,18 +231,46 @@ router.get('/download/:id/:type', async (req, res) => {
     const field = type === 'chrome' ? 'download_count_chrome' : 'download_count_360'
     await pool.query(`UPDATE extension_version SET ${field} = ${field} + 1 WHERE id = ?`, [id])
 
-    // 下载文件名：智查查插件_浏览器类型_v版本号.zip
+    // 下载文件名：智查查插件_浏览器类型_v版本号.原始后缀
     const browserLabel = type === 'chrome' ? 'Chrome谷歌' : '360浏览器'
-    const downloadName = encodeURIComponent(`智查查插件_${browserLabel}_v${record.version}.zip`)
+    // 提取原始文件后缀
+    const ext = path.extname(filename)
+    const downloadFileName = `智查查插件_${browserLabel}_v${record.version}${ext}`
+    const downloadName = encodeURIComponent(downloadFileName)
+
+    // 禁用缓存
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Expires', '0')
+
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${downloadName}`)
-    res.setHeader('Content-Type', 'application/zip')
+    // 根据后缀设置正确mime
+    if(ext === '.crx'){
+      res.setHeader('Content-Type', 'application/x-chrome-extension')
+    }else{
+      res.setHeader('Content-Type', 'application/zip')
+    }
+
     const fileStream = fs.createReadStream(filePath)
+
+    // 监听流错误
+    fileStream.on('error', (streamErr) => {
+      console.error('文件读取流错误:', streamErr)
+      if (!res.headersSent) {
+        res.status(500).json({ code: -1, msg: '读取文件失败:' + streamErr.message })
+      }
+    })
+
     fileStream.pipe(res)
+
   } catch (err) {
     console.error('下载插件文件失败:', err)
-    res.status(500).json({ code: -1, msg: '下载失败: ' + err.message })
+    if (!res.headersSent) {
+      res.status(500).json({ code: -1, msg: '下载失败: ' + err.message })
+    }
   }
 })
+
 
 /**
  * DELETE /api/extension/:id
