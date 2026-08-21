@@ -641,12 +641,15 @@ router.post('/matchByAccount', auth, async (req, res) => {
       }
     })
 
-    // 排序：高>中>低，同等级按订单数倒序
+    // 排序：风险等级高>中>低，同等级按最新订单时间降序，再按订单数倒序
     groups.sort((a, b) => {
       const levelOrder = { high: 3, medium: 2, low: 1 }
       if (levelOrder[b.riskLevel] !== levelOrder[a.riskLevel]) {
         return levelOrder[b.riskLevel] - levelOrder[a.riskLevel]
       }
+      const timeA = a.orders[0] ? new Date(a.orders[0].order_time).getTime() : 0
+      const timeB = b.orders[0] ? new Date(b.orders[0].order_time).getTime() : 0
+      if (timeB !== timeA) return timeB - timeA
       return b.totalOrderCount - a.totalOrderCount
     })
 

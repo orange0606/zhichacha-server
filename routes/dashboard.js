@@ -208,12 +208,13 @@ router.get('/shop-stats', auth, async (req, res) => {
 router.get('/recent-reports', auth, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT id, dispute_type, order_no, buyer_account, reason, status, create_time
-       FROM report
-       WHERE user_id = ?
-       ORDER BY create_time DESC
-       LIMIT 10`,
-      [req.userId]
+      `SELECT r.id, r.dispute_type, r.order_no, r.buyer_account, r.receiver_name,
+              r.receiver_phone, r.receiver_address, r.reason, r.status, r.create_time,
+              u.username AS reporter_name
+       FROM report r
+       LEFT JOIN user u ON r.user_id = u.id
+       ORDER BY r.create_time DESC
+       LIMIT 10`
     )
 
     const typeMap = {
@@ -230,6 +231,10 @@ router.get('/recent-reports', auth, async (req, res) => {
       disputeTypeText: typeMap[r.dispute_type] || '未知',
       orderNo: r.order_no,
       buyerAccount: r.buyer_account,
+      receiverName: r.receiver_name,
+      receiverPhone: r.receiver_phone,
+      receiverAddress: r.receiver_address,
+      reporterName: r.reporter_name,
       reason: r.reason,
       status: r.status,
       statusText: statusMap[r.status] || '未知',

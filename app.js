@@ -1,5 +1,6 @@
 const express = require('express')
 const cors = require('cors')
+const path = require('path')
 const app = express()
 
 // 中间件
@@ -10,6 +11,9 @@ app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 // 如果有表单提交，urlencoded 也可以同步加大
 app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+
+// 静态文件服务 - 插件下载文件
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
 
 // 健康检查接口
 app.get('/api/health', (req, res) => {
@@ -24,6 +28,7 @@ app.use('/api/search', require('./routes/search'))
 app.use('/api/report', require('./routes/report'))
 app.use('/api/dashboard', require('./routes/dashboard'))
 app.use('/api/risk', require('./routes/risk'))
+app.use('/api/extension', require('./routes/extension'))
 
 // 错误处理中间件
 app.use((err, req, res, next) => {
