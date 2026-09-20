@@ -1,4 +1,4 @@
-const express = require('express')
+﻿const express = require('express')
 const cors = require('cors')
 const path = require('path')
 const app = express()
@@ -22,6 +22,7 @@ app.get('/api/health', (req, res) => {
 
 // 路由注册
 app.use('/api/auth', require('./routes/auth'))
+app.use('/api/user', require('./routes/user'))
 app.use('/api/shop', require('./routes/shop'))
 app.use('/api/order', require('./routes/order'))
 app.use('/api/search', require('./routes/search'))

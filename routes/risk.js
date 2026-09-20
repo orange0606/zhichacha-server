@@ -1,4 +1,4 @@
-const express = require('express')
+﻿const express = require('express')
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
@@ -20,19 +20,30 @@ router.post('/batchMatch', auth, async (req, res) => {
     const allAccounts = [...new Set(list.map(i => i.buyerAccount).filter(Boolean))]
     const allAddresses = [...new Set(list.map(i => i.buyerAddress).filter(Boolean))]
 
-    // ========== 1. 账号维度：全库订单统计 ==========
+    // ========== 1. 账号维度：全库订单统计（含跨店铺金额） ==========
     const accountOrderMap = {}
     if (allAccounts.length > 0) {
       const ph = allAccounts.map(() => '?').join(',')
       const [rows] = await pool.query(
-        `SELECT buyer_account, shop_id FROM \`order\` WHERE buyer_account IN (${ph})`,
+        `SELECT buyer_account, shop_id, pay_amount, order_time FROM \`order\` WHERE buyer_account IN (${ph}) ORDER BY order_time DESC`,
         allAccounts
       )
       rows.forEach(r => {
         if (!accountOrderMap[r.buyer_account]) {
-          accountOrderMap[r.buyer_account] = { shopIds: new Set() }
+          accountOrderMap[r.buyer_account] = { shopIds: new Set(), shopOrderMap: {} }
         }
-        accountOrderMap[r.buyer_account].shopIds.add(String(r.shop_id))
+        const sid = String(r.shop_id)
+        accountOrderMap[r.buyer_account].shopIds.add(sid)
+        // 按店铺分组记录订单金额和时间（已按时间倒序）
+        if (r.pay_amount != null) {
+          if (!accountOrderMap[r.buyer_account].shopOrderMap[sid]) {
+            accountOrderMap[r.buyer_account].shopOrderMap[sid] = []
+          }
+          accountOrderMap[r.buyer_account].shopOrderMap[sid].push({
+            amount: Number(r.pay_amount),
+            time: r.order_time ? new Date(r.order_time).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''
+          })
+        }
       })
     }
 
@@ -56,25 +67,25 @@ router.post('/batchMatch', auth, async (req, res) => {
       }
     }
 
-    // ========== 3. 账号被举报次数 ==========
+    // ========== 3. 账号被举报次数（排除已撤销的） ==========
     const accountReportMap = {}
     if (allAccounts.length > 0) {
       const ph = allAccounts.map(() => '?').join(',')
       const [rows] = await pool.query(
-        `SELECT buyer_account, COUNT(*) as cnt FROM report WHERE buyer_account IN (${ph}) GROUP BY buyer_account`,
+        `SELECT buyer_account, COUNT(*) as cnt FROM report WHERE buyer_account IN (${ph}) AND status = 1 GROUP BY buyer_account`,
         allAccounts
       )
       rows.forEach(r => { accountReportMap[r.buyer_account] = r.cnt })
     }
 
-    // ========== 4. 地址被举报次数（智能模糊匹配） ==========
+    // ========== 4. 地址被举报次数（智能模糊匹配，排除已撤销的） ==========
     const addressReportMap = {}
     const similarReportMap = {}
     if (allAddresses.length > 0) {
       const [allReportRows] = await pool.query(
         `SELECT DISTINCT receiver_address FROM report
          WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
-           AND receiver_address NOT LIKE '%*%' LIMIT 5000`
+           AND receiver_address NOT LIKE '%*%' AND status = 1 LIMIT 5000`
       )
       const allReportAddrs = allReportRows.map(r => r.receiver_address)
       const preprocessed = preprocessAddresses(allReportAddrs)
@@ -123,6 +134,19 @@ router.post('/batchMatch', auth, async (req, res) => {
 
       const accStat = accountOrderMap[buyerAccount]
       const crossShopCount = accStat ? accStat.shopIds.size : 1
+
+      // 提取跨店铺（非当前店铺）的订单，最多前5个
+      let crossShopOrders = []
+      if (accStat && crossShopCount >= 2) {
+        const orders = []
+        for (const [sid, orderList] of Object.entries(accStat.shopOrderMap)) {
+          if (sid !== myShopId) {
+            orders.push(...orderList)
+          }
+        }
+        crossShopOrders = orders.slice(0, 5)
+      }
+
       if (crossShopCount >= 2) {
         tags.push(`全库跨${crossShopCount}家店铺(账号)`)
         if (riskLevel === 'none') riskLevel = 'medium'
@@ -147,6 +171,7 @@ router.post('/batchMatch', auth, async (req, res) => {
         accountReportCount: accReportCount,
         addressReportCount: addrReportCount,
         crossShopCount,
+        crossShopOrders,
         addressCrossShopCount: addrCrossShopCount,
         addressSimilarity: similarity,
         similarAddresses: similarAddrs,

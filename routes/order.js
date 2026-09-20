@@ -1,4 +1,4 @@
-const express = require('express')
+﻿const express = require('express')
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
@@ -500,7 +500,7 @@ router.post('/matchByAccount', auth, async (req, res) => {
     if (accounts.length > 0) {
       const ph = accounts.map(() => '?').join(',')
       const [rows] = await pool.query(
-        `SELECT buyer_account, COUNT(*) as cnt FROM report WHERE buyer_account IN (${ph}) GROUP BY buyer_account`,
+        `SELECT buyer_account, COUNT(*) as cnt FROM report WHERE buyer_account IN (${ph}) AND status = 1 GROUP BY buyer_account`,
         accounts
       )
       rows.forEach(r => { accountReportMap[r.buyer_account] = r.cnt })
@@ -512,7 +512,7 @@ router.post('/matchByAccount', auth, async (req, res) => {
       const [allReportRows] = await pool.query(
         `SELECT receiver_address FROM report
          WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
-           AND receiver_address NOT LIKE '%*%'`
+           AND receiver_address NOT LIKE '%*%' AND status = 1`
       )
       const allReportAddrs = allReportRows.map(r => r.receiver_address)
       const preprocessed = preprocessAddresses(allReportAddrs)

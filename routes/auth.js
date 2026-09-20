@@ -1,4 +1,4 @@
-const express = require('express')
+﻿const express = require('express')
 const router = express.Router()
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
@@ -20,7 +20,7 @@ router.post('/register', async (req, res) => {
     }
 
     // 检查账号是否已存在
-    const [existing] = await pool.query('SELECT id FROM user WHERE username = ?', [username])
+    const [existing] = await pool.query('SELECT id FROM `user` WHERE username = ?', [username])
     if (existing.length > 0) {
       return res.json({ code: -1, msg: '该账号已存在' })
     }
@@ -29,7 +29,7 @@ router.post('/register', async (req, res) => {
     const hashedPassword = bcrypt.hashSync(password, 10)
 
     // 插入用户
-    await pool.query('INSERT INTO user (username, password) VALUES (?, ?)', [username, hashedPassword])
+    await pool.query('INSERT INTO `user` (username, password) VALUES (?, ?)', [username, hashedPassword])
 
     res.json({ code: 0, msg: '注册成功' })
   } catch (err) {
@@ -48,7 +48,7 @@ router.post('/login', async (req, res) => {
     }
 
     // 查询用户
-    const [users] = await pool.query('SELECT * FROM user WHERE username = ?', [username])
+    const [users] = await pool.query('SELECT * FROM `user` WHERE username = ?', [username])
     if (users.length === 0) {
       return res.json({ code: -1, msg: '账号不存在' })
     }
@@ -60,6 +60,11 @@ router.post('/login', async (req, res) => {
       return res.json({ code: -1, msg: '密码错误' })
     }
 
+    // 检查账号状态
+    if (user.status === 0) {
+      return res.json({ code: -1, msg: '账号已被限制登录，请联系管理员' })
+    }
+
     // 生成token（有效期3个月，支持多设备同时登录）
     const token = jwt.sign({ userId: user.id }, SECRET_KEY, { expiresIn: '90d' })
 
@@ -69,7 +74,8 @@ router.post('/login', async (req, res) => {
       data: {
         token,
         userId: user.id,
-        username: user.username
+        username: user.username,
+        isAdmin: user.is_admin === 1
       }
     })
   } catch (err) {
@@ -91,7 +97,7 @@ router.post('/change-username', authMiddleware, async (req, res) => {
     }
 
     // 查当前用户
-    const [users] = await pool.query('SELECT * FROM user WHERE id = ?', [req.userId])
+    const [users] = await pool.query('SELECT * FROM `user` WHERE id = ?', [req.userId])
     if (users.length === 0) {
       return res.json({ code: -1, msg: '用户不存在' })
     }
@@ -107,12 +113,12 @@ router.post('/change-username', authMiddleware, async (req, res) => {
     }
 
     // 检查新用户名是否已被占用
-    const [existing] = await pool.query('SELECT id FROM user WHERE username = ? AND id != ?', [newUsername, req.userId])
+    const [existing] = await pool.query('SELECT id FROM `user` WHERE username = ? AND id != ?', [newUsername, req.userId])
     if (existing.length > 0) {
       return res.json({ code: -1, msg: '该用户名已被占用' })
     }
 
-    await pool.query('UPDATE user SET username = ? WHERE id = ?', [newUsername, req.userId])
+    await pool.query('UPDATE `user` SET username = ? WHERE id = ?', [newUsername, req.userId])
 
     res.json({ code: 0, msg: '用户名修改成功', data: { username: newUsername } })
   } catch (err) {
@@ -137,7 +143,7 @@ router.post('/change-password', authMiddleware, async (req, res) => {
     }
 
     // 查当前用户
-    const [users] = await pool.query('SELECT * FROM user WHERE id = ?', [req.userId])
+    const [users] = await pool.query('SELECT * FROM `user` WHERE id = ?', [req.userId])
     if (users.length === 0) {
       return res.json({ code: -1, msg: '用户不存在' })
     }
@@ -148,7 +154,7 @@ router.post('/change-password', authMiddleware, async (req, res) => {
     }
 
     const hashedPassword = bcrypt.hashSync(newPassword, 10)
-    await pool.query('UPDATE user SET password = ? WHERE id = ?', [hashedPassword, req.userId])
+    await pool.query('UPDATE `user` SET password = ? WHERE id = ?', [hashedPassword, req.userId])
 
     res.json({ code: 0, msg: '密码修改成功' })
   } catch (err) {

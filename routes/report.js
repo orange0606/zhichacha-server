@@ -56,6 +56,33 @@ function calcSimilarity(item, keyword) {
 }
 
 /**
+ * 根据订单号查询订单信息（用于举报表单预填）
+ */
+router.get('/orderInfo', auth, async (req, res) => {
+  try {
+    const { orderNo } = req.query
+    if (!orderNo) {
+      return res.json({ code: -1, msg: '订单号不能为空' })
+    }
+
+    const [rows] = await pool.query(
+      `SELECT order_no, buyer_account, buyer_name, buyer_phone, buyer_address, goods_name, pay_amount, order_time
+       FROM \`order\` WHERE order_no = ? LIMIT 1`,
+      [orderNo]
+    )
+
+    if (rows.length === 0) {
+      return res.json({ code: -1, msg: '未找到该订单' })
+    }
+
+    res.json({ code: 0, data: rows[0] })
+  } catch (err) {
+    console.error('查询订单信息失败:', err)
+    res.json({ code: -1, msg: '查询失败: ' + err.message })
+  }
+})
+
+/**
  * 提交举报
  */
 router.post('/submit', auth, async (req, res) => {
