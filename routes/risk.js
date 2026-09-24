@@ -25,7 +25,11 @@ router.post('/batchMatch', auth, async (req, res) => {
     if (allAccounts.length > 0) {
       const ph = allAccounts.map(() => '?').join(',')
       const [rows] = await pool.query(
-        `SELECT buyer_account, shop_id, pay_amount, order_time FROM \`order\` WHERE buyer_account IN (${ph}) ORDER BY order_time DESC`,
+        `SELECT o.buyer_account, o.shop_id, o.shop_name, o.pay_amount, o.order_time, u.username AS owner_account
+         FROM \`order\` o
+         LEFT JOIN \`shop\` s ON o.shop_id = s.shop_id
+         LEFT JOIN \`user\` u ON s.user_id = u.id
+         WHERE o.buyer_account IN (${ph}) ORDER BY o.order_time DESC`,
         allAccounts
       )
       rows.forEach(r => {
@@ -40,14 +44,13 @@ router.post('/batchMatch', auth, async (req, res) => {
             accountOrderMap[r.buyer_account].shopOrderMap[sid] = []
           }
           accountOrderMap[r.buyer_account].shopOrderMap[sid].push({
+            ownerAccount: r.owner_account || '',
             amount: Number(r.pay_amount),
             time: r.order_time ? new Date(r.order_time).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''
           })
         }
       })
     }
-
-    // ========== 2. 地址维度：全库订单统计（智能模糊匹配） ==========
     const addressOrderMap = {}
     if (allAddresses.length > 0) {
       const [allOrderAddrRows] = await pool.query(

@@ -2,7 +2,110 @@
 const router = express.Router()
 const pool = require('../config/db')
 const auth = require('../middleware/auth')
-const { isAddressMatch, preprocessAddresses, batchMatchAddress } = require('../utils/addressMatcher')
+const { isAddressMatch, preprocessAddresses, batchMatchAddress, normalizeAddress, calcSimilarity } = require('../utils/addressMatcher')
+
+// ========== 内存缓存：全库订单地址（预处理好的） ==========
+let orderAddressCache = {
+  data: [],
+  preprocessed: [],
+  byPrefix: new Map(),
+  updateTime: 0,
+  ttl: 5 * 60 * 1000
+}
+
+let reportAddressCache = {
+  addresses: [],
+  preprocessed: [],
+  byPrefix: new Map(),
+  updateTime: 0,
+  ttl: 5 * 60 * 1000
+}
+
+async function loadOrderAddressCache() {
+  const now = Date.now()
+  if (orderAddressCache.data.length > 0 && (now - orderAddressCache.updateTime) < orderAddressCache.ttl) {
+    return orderAddressCache
+  }
+
+  console.log("[风险检测] 刷新全库订单地址缓存...")
+  const sql = "SELECT id, shop_id, order_no, goods_name, goods_count, pay_amount, order_time, " +
+              "buyer_account, buyer_name, buyer_address, buyer_phone " +
+              "FROM `order` " +
+              "WHERE buyer_address IS NOT NULL AND CHAR_LENGTH(buyer_address) >= 6 " +
+              "AND buyer_address NOT LIKE '%*%'"
+  const [rows] = await pool.query(sql)
+
+  const preprocessed = preprocessAddresses(rows.map(o => o.buyer_address))
+
+  const byPrefix = new Map()
+  preprocessed.forEach(item => {
+    const prefix = item.norm.substring(0, 4)
+    if (!byPrefix.has(prefix)) byPrefix.set(prefix, [])
+    byPrefix.get(prefix).push(item)
+  })
+
+  orderAddressCache = { data: rows, preprocessed, byPrefix, updateTime: now }
+  console.log("[风险检测] 订单地址缓存刷新完成，共 " + rows.length + " 条，" + byPrefix.size + " 个前缀组")
+  return orderAddressCache
+}
+
+async function loadReportAddressCache() {
+  const now = Date.now()
+  if (reportAddressCache.addresses.length > 0 && (now - reportAddressCache.updateTime) < reportAddressCache.ttl) {
+    return reportAddressCache
+  }
+
+  console.log("[风险检测] 刷新举报地址缓存...")
+  const sql = "SELECT receiver_address FROM report " +
+              "WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6 " +
+              "AND receiver_address NOT LIKE '%*%' AND status = 1"
+  const [rows] = await pool.query(sql)
+
+  const addresses = rows.map(r => r.receiver_address)
+  const preprocessed = preprocessAddresses(addresses)
+
+  const byPrefix = new Map()
+  preprocessed.forEach(item => {
+    const prefix = item.norm.substring(0, 4)
+    if (!byPrefix.has(prefix)) byPrefix.set(prefix, [])
+    byPrefix.get(prefix).push(item)
+  })
+
+  reportAddressCache = { addresses, preprocessed, byPrefix, updateTime: now }
+  console.log("[风险检测] 举报地址缓存刷新完成，共 " + addresses.length + " 条")
+  return reportAddressCache
+}
+
+function matchAddressFromCache(searchAddr, cache) {
+  if (!searchAddr || searchAddr.length < 6) return []
+
+  const targetNorm = normalizeAddress(searchAddr)
+  if (targetNorm.length < 8) return []
+
+  const targetPrefix = targetNorm.substring(0, 4)
+  let candidates = []
+  if (cache.byPrefix.has(targetPrefix)) {
+    candidates = cache.byPrefix.get(targetPrefix)
+  }
+
+  const matched = []
+  for (const item of candidates) {
+    if (item.norm === targetNorm) {
+      matched.push(item.index)
+      continue
+    }
+    const minLen = Math.min(item.norm.length, targetNorm.length)
+    const maxLen = Math.max(item.norm.length, targetNorm.length)
+    if (minLen / maxLen < 0.7) continue
+
+    const sim = calcSimilarity(item.norm, targetNorm)
+    if (sim >= 0.7) {
+      matched.push(item.index)
+    }
+  }
+
+  return matched
+}
 
 // 获取订单列表
 router.get('/list', auth, async (req, res) => {
@@ -418,7 +521,7 @@ router.post('/batchAdd', auth, async (req, res) => {
  */
 router.post('/matchByAccount', auth, async (req, res) => {
   try {
-    const { startTime, endTime } = req.body
+    const { startTime, endTime, type } = req.body
 
     if (!startTime || !endTime) {
       return res.json({ code: -1, msg: '请选择开始时间和结束时间' })
@@ -434,7 +537,7 @@ router.post('/matchByAccount', auth, async (req, res) => {
     if (shopIds.length === 0) {
       return res.json({
         code: 0,
-        data: { groups: [], userShopCount: 0, riskAccountCount: 0, totalOrder: 0, shopCount: 0 }
+        data: { groups: [], highRiskCount: 0, userShopCount: 0, riskAccountCount: 0, totalOrder: 0, shopCount: 0 }
       })
     }
 
@@ -458,13 +561,13 @@ router.post('/matchByAccount', auth, async (req, res) => {
     if (accounts.length === 0 && addresses.length === 0) {
       return res.json({
         code: 0,
-        data: { groups: [], userShopCount: shopIds.length, riskAccountCount: 0, totalOrder: 0, shopCount: 0 }
+        data: { groups: [], highRiskCount: 0, userShopCount: shopIds.length, riskAccountCount: 0, totalOrder: 0, shopCount: 0 }
       })
     }
 
     // 第三步：全库查询账号匹配订单（全部时段）
     let accountOrders = []
-    if (accounts.length > 0) {
+    if (accounts.length > 0 && type !== 'address') {
       const ph = accounts.map(() => '?').join(',')
       const [rows] = await pool.query(
         `SELECT o.* FROM \`order\` o
@@ -476,17 +579,23 @@ router.post('/matchByAccount', auth, async (req, res) => {
     }
 
     // 第四步：全库查询地址匹配订单（智能模糊匹配）
+    // 第四步：全库查询地址匹配订单（智能模糊匹配）
     const addressMatchMap = new Map()
-    if (addresses.length > 0) {
-      const [allAddrOrders] = await pool.query(
-        `SELECT o.* FROM \`order\` o
-         WHERE o.buyer_address IS NOT NULL AND CHAR_LENGTH(o.buyer_address) >= 6
-           AND o.buyer_address NOT LIKE '%*%'
-         ORDER BY o.order_time DESC`
-      )
+    // 过滤掉脱敏地址（带星号的），这些地址匹配不准，跳过
+    const validAddresses = addresses.filter(addr => addr && !addr.includes('*'))
+    if (validAddresses.length > 0 && type !== 'account') {
+      // 只查最近90天的订单，减少数据量
+      const sql = "SELECT id, shop_id, order_no, goods_name, goods_count, pay_amount, order_time, " +
+                  "buyer_account, buyer_name, buyer_address, buyer_phone " +
+                  "FROM `order` " +
+                  "WHERE buyer_address IS NOT NULL AND CHAR_LENGTH(buyer_address) >= 6 " +
+                  "AND buyer_address NOT LIKE '%*%' " +
+                  "AND order_time >= DATE_SUB(NOW(), INTERVAL 90 DAY) " +
+                  "ORDER BY order_time DESC"
+      const [allAddrOrders] = await pool.query(sql)
       // 预处理全库地址（标准化一次）
       const preprocessed = preprocessAddresses(allAddrOrders.map(o => o.buyer_address))
-      addresses.forEach(addr => {
+      validAddresses.forEach(addr => {
         if (!addr || addr.length < 6) return
         const matchedIndexes = batchMatchAddress(addr, preprocessed)
         if (matchedIndexes.length > 0) {
@@ -497,7 +606,7 @@ router.post('/matchByAccount', auth, async (req, res) => {
 
     // 第五步：查询账号被举报次数
     const accountReportMap = {}
-    if (accounts.length > 0) {
+    if (accounts.length > 0 && type !== 'address') {
       const ph = accounts.map(() => '?').join(',')
       const [rows] = await pool.query(
         `SELECT buyer_account, COUNT(*) as cnt FROM report WHERE buyer_account IN (${ph}) AND status = 1 GROUP BY buyer_account`,
@@ -507,16 +616,16 @@ router.post('/matchByAccount', auth, async (req, res) => {
     }
 
     // 第六步：查询地址被举报次数（智能模糊匹配）
+    // 第六步：查询地址被举报次数（智能模糊匹配）
     const addressReportMap = {}
-    if (addresses.length > 0) {
-      const [allReportRows] = await pool.query(
-        `SELECT receiver_address FROM report
-         WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6
-           AND receiver_address NOT LIKE '%*%' AND status = 1`
-      )
+    if (validAddresses.length > 0 && type !== 'account') {
+      const sql = "SELECT receiver_address FROM report " +
+                  "WHERE receiver_address IS NOT NULL AND CHAR_LENGTH(receiver_address) >= 6 " +
+                  "AND receiver_address NOT LIKE '%*%' AND status = 1"
+      const [allReportRows] = await pool.query(sql)
       const allReportAddrs = allReportRows.map(r => r.receiver_address)
       const preprocessed = preprocessAddresses(allReportAddrs)
-      addresses.forEach(addr => {
+      validAddresses.forEach(addr => {
         if (!addr || addr.length < 6) return
         const cnt = batchMatchAddress(addr, preprocessed).length
         if (cnt > 0) addressReportMap[addr] = cnt
@@ -661,6 +770,7 @@ router.post('/matchByAccount', auth, async (req, res) => {
       code: 0,
       data: {
         groups,
+        highRiskCount: groups.filter(g => g.riskLevel === 'high').length,
         userShopCount: shopIds.length,
         riskAccountCount: groups.length,
         totalOrder: allOrders.length,
@@ -668,8 +778,7 @@ router.post('/matchByAccount', auth, async (req, res) => {
       }
     })
   } catch (err) {
-    console.error('跨店铺账号匹配查询错误:', err)
-    res.json({ code: -1, msg: '查询失败: ' + err.message })
   }
 })
 module.exports = router
+
