@@ -25,7 +25,7 @@ router.post('/batchMatch', auth, async (req, res) => {
     if (allAccounts.length > 0) {
       const ph = allAccounts.map(() => '?').join(',')
       const [rows] = await pool.query(
-        `SELECT o.buyer_account, o.shop_id, o.shop_name, o.pay_amount, o.order_time, u.username AS owner_account
+        `SELECT o.order_no, o.buyer_account, o.shop_id, o.shop_name, o.pay_amount, o.order_time, u.username AS owner_account
          FROM \`order\` o
          LEFT JOIN \`shop\` s ON o.shop_id = s.shop_id
          LEFT JOIN \`user\` u ON s.user_id = u.id
@@ -44,6 +44,7 @@ router.post('/batchMatch', auth, async (req, res) => {
             accountOrderMap[r.buyer_account].shopOrderMap[sid] = []
           }
           accountOrderMap[r.buyer_account].shopOrderMap[sid].push({
+            orderNo: r.order_no,
             ownerAccount: r.owner_account || '',
             amount: Number(r.pay_amount),
             time: r.order_time ? new Date(r.order_time).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''
@@ -51,6 +52,7 @@ router.post('/batchMatch', auth, async (req, res) => {
         }
       })
     }
+
     const addressOrderMap = {}
     if (allAddresses.length > 0) {
       const [allOrderAddrRows] = await pool.query(
@@ -65,7 +67,8 @@ router.post('/batchMatch', auth, async (req, res) => {
         if (matchedIndexes.length > 0) {
           const shopIds = new Set()
           matchedIndexes.forEach(i => shopIds.add(String(allOrderAddrRows[i].shop_id)))
-          addressOrderMap[addr] = { shopIds }
+          const matchedAddrs = matchedIndexes.map(i => allOrderAddrRows[i].buyer_address)
+          addressOrderMap[addr] = { shopIds, matchedAddrs }
         }
       }
     }
@@ -137,25 +140,30 @@ router.post('/batchMatch', auth, async (req, res) => {
 
       const accStat = accountOrderMap[buyerAccount]
       const crossShopCount = accStat ? accStat.shopIds.size : 1
-
+      const addrStat = addressOrderMap[buyerAddress]
       // 提取跨店铺（非当前店铺）的订单，最多前5个
-      let crossShopOrders = []
-      if (accStat && crossShopCount >= 2) {
-        const orders = []
-        for (const [sid, orderList] of Object.entries(accStat.shopOrderMap)) {
+      // 提取跨店铺（非当前店铺）订单：账号维度 + 地址维度都要，合并去重最多5条
+      const crossOrderSet = new Set();
+      const crossOrderList = [];
+      const pushCrossOrders = (stat) => {
+        if (!stat || !stat.shopOrderMap) return;
+        for (const [sid, orderList] of Object.entries(stat.shopOrderMap)) {
           if (sid !== myShopId) {
-            orders.push(...orderList)
+            orderList.forEach(o => {
+              if (!crossOrderSet.has(o.orderNo)) { crossOrderSet.add(o.orderNo); crossOrderList.push(o); }
+            });
           }
         }
-        crossShopOrders = orders.slice(0, 5)
-      }
+      };
+      pushCrossOrders(accStat);
+      pushCrossOrders(addrStat);
+      const crossShopOrders = crossOrderList.slice(0, 5);
 
       if (crossShopCount >= 2) {
         tags.push(`全库跨${crossShopCount}家店铺(账号)`)
         if (riskLevel === 'none') riskLevel = 'medium'
       }
 
-      const addrStat = addressOrderMap[buyerAddress]
       const addrCrossShopCount = addrStat ? addrStat.shopIds.size : 1
       if (addrCrossShopCount >= 2) {
         tags.push(`全库跨${addrCrossShopCount}家店铺(地址)`)
@@ -206,6 +214,58 @@ router.post('/batchMatch', auth, async (req, res) => {
           r.tags.push(`同店铺下单${sameCnt}次`)
           r.riskLevel = 'low'
           r.riskLevelText = '低风险'
+        }
+      }
+    }
+
+
+    // ========== 7. 地址跨店：按需查询跨店订单详情（仅命中地址，最近90天） ==========
+    const addrCrossResults = results.filter(r => r.addressCrossShopCount >= 2)
+    if (addrCrossResults.length > 0) {
+      const addrMap = {}
+      for (const r of addrCrossResults) {
+        const stat = addressOrderMap[r.buyerAddress]
+        if (stat && stat.matchedAddrs) {
+          stat.matchedAddrs.forEach(a => { addrMap[a] = true })
+        }
+      }
+      const addrList = Object.keys(addrMap)
+      if (addrList.length > 0) {
+        const ph = addrList.map(() => '?').join(',')
+        const [addrOrderRows] = await pool.query(
+          `SELECT o.order_no, o.buyer_address, o.shop_id, o.pay_amount, o.order_time, u.username AS owner_account
+           FROM \`order\` o
+           LEFT JOIN \`shop\` s ON o.shop_id = s.shop_id
+           LEFT JOIN \`user\` u ON s.user_id = u.id
+           WHERE o.buyer_address IN (${ph})
+             AND o.order_time >= DATE_SUB(NOW(), INTERVAL 90 DAY)
+           ORDER BY o.order_time DESC`,
+          addrList
+        )
+        const addrOrderGroup = {}
+        addrOrderRows.forEach(r => {
+          if (!addrOrderGroup[r.buyer_address]) addrOrderGroup[r.buyer_address] = []
+          addrOrderGroup[r.buyer_address].push({
+            orderNo: r.order_no,
+            ownerAccount: r.owner_account || '',
+            amount: Number(r.pay_amount),
+            time: r.order_time ? new Date(r.order_time).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''
+          })
+        })
+        for (const r of addrCrossResults) {
+          const stat = addressOrderMap[r.buyerAddress]
+          if (!stat || !stat.matchedAddrs) continue
+          const existSet = new Set(r.crossShopOrders.map(o => o.orderNo))
+          const merged = [...r.crossShopOrders]
+          for (const ma of stat.matchedAddrs) {
+            (addrOrderGroup[ma] || []).forEach(o => {
+              if (String(o.orderNo) !== String(r.orderNo) && !existSet.has(o.orderNo) && merged.length < 5) {
+                existSet.add(o.orderNo)
+                merged.push(o)
+              }
+            })
+          }
+          r.crossShopOrders = merged.slice(0, 5)
         }
       }
     }
